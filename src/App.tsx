@@ -74,6 +74,8 @@ function sequenceBars(seqId: string): Bar[] {
 type Mixer = {
   ctx: AudioContext,
   master: GainNode,
+  limiter: DynamicsCompressorNode,
+  masterOut: GainNode,
   drumBus: GainNode,
   bassBus: GainNode,
   guitarBus: GainNode,
@@ -102,7 +104,15 @@ function createMixer(): Mixer {
   const AC: any = (window as any).AudioContext || (window as any).webkitAudioContext;
   if (!AC) { throw new Error("WebAudio não suportado neste navegador."); }
   const ctx = new AC();
-  const master = ctx.createGain(); master.gain.value = 0.9; master.connect(ctx.destination);
+  const master = ctx.createGain(); master.gain.value = 1.0;
+  const limiter = ctx.createDynamicsCompressor();
+  limiter.threshold.value = -8;
+  limiter.knee.value = 0;
+  limiter.ratio.value = 20;
+  limiter.attack.value = 0.003;
+  limiter.release.value = 0.25;
+  const masterOut = ctx.createGain(); masterOut.gain.value = 0.9;
+  master.connect(limiter).connect(masterOut).connect(ctx.destination);
   const drumBus = ctx.createGain(); drumBus.gain.value = 0.9; drumBus.connect(master);
   const bassBus = ctx.createGain(); bassBus.gain.value = 0.8; bassBus.connect(master);
   const guitarBus = ctx.createGain(); guitarBus.gain.value = 0.7; guitarBus.connect(master);
@@ -125,7 +135,7 @@ function createMixer(): Mixer {
   leadIn.connect(reverb).connect(reverbWet).connect(leadWet);
   leadWet.connect(leadBus);
 
-  return { ctx, master, drumBus, bassBus, guitarBus, leadBus, leadIn, leadDry, leadWet, delay, delayFB, delayWet, reverb, reverbWet };
+  return { ctx, master, limiter, masterOut, drumBus, bassBus, guitarBus, leadBus, leadIn, leadDry, leadWet, delay, delayFB, delayWet, reverb, reverbWet };
 }
 
 function playBufferOnce(m: Mixer, buffer: AudioBuffer, dest: AudioNode, time:number, vol=1, detuneCents=0){
@@ -324,9 +334,17 @@ function useTransport(mixerRef: React.MutableRefObject<Mixer|null>, currentSeqId
     const now = ctx.currentTime + 0.05; stateRef.current = { isPlaying:true, tempo: stateRef.current.tempo || 100, step:0, barIndex:0, nextTickTime: now };
     setT(stateRef.current); if (timerRef.current) window.clearTimeout(timerRef.current); timerRef.current = window.setTimeout(scheduleStep, 10);
   }
+  function startAt(atTime: number){
+    const m = mixerRef.current; if (!m) return; const ctx = m.ctx; if (ctx.state === "suspended") { ctx.resume().catch(()=>{}); }
+    stateRef.current = { isPlaying:true, tempo: stateRef.current.tempo || 100, step:0, barIndex:0, nextTickTime: atTime };
+    setT(stateRef.current);
+    if (timerRef.current) window.clearTimeout(timerRef.current);
+    const msUntil = Math.max(0, (atTime - ctx.currentTime - 0.02) * 1000);
+    timerRef.current = window.setTimeout(scheduleStep, Math.min(msUntil, 200));
+  }
   function stop() { if (timerRef.current) window.clearTimeout(timerRef.current); timerRef.current = null; stateRef.current = { ...stateRef.current, isPlaying:false, step:0, barIndex:0, nextTickTime:0 }; setT(stateRef.current); }
   useEffect(()=>() => { if (timerRef.current) window.clearTimeout(timerRef.current); }, []);
-  return { t, setT, start, stop, bars };
+  return { t, setT, start, startAt, stop, bars };
 }
 
 const KEYBOARD_RANGE = { firstMidi: 60, lastMidi: 84 };
@@ -528,13 +546,15 @@ const CSS = `
 export default function App(){
   const [seqId, setSeqId] = useState<string>(SEQUENCES[0].id);
   const [tempo, setTempo] = useState<number>(100);
-  const [volumes, setVolumes] = useState({drum:1, bass:0.9, guitar:0.8, lead:1});
+  const [volumes, setVolumes] = useState({master:0.9, drum:1, bass:0.9, guitar:0.8, lead:1});
   const [mutes, setMutes] = useState({drum:false, bass:false, guitar:false});
   const [drumSource, setDrumSource] = useState<'sequence'|'loops'>('sequence');
   const [bassSource, setBassSource] = useState<'sequence'|'loops'>('sequence');
   const [ctxReady, setCtxReady] = useState(false);
   const [quantize, setQuantize] = useState(true);
   const [maxVoices, setMaxVoices] = useState(8);
+  const tapTimesRef = useRef<number[]>([]);
+  const [countIn, setCountIn] = useState<boolean>(false);
 
   const [leadEngine, setLeadEngine] = useState<LeadEngine>("synth");
   const [synth, setSynth] = useState<SynthSettings>({
@@ -544,7 +564,7 @@ export default function App(){
 
   const mixerRef = useRef<Mixer|null>(null);
   useEffect(()=>{ const style = document.createElement('style'); style.innerHTML = CSS; document.head.appendChild(style); return ()=>{ style.remove(); }; },[]);
-  function ensureCtx(){ if (!mixerRef.current){ const m = createMixer(); m.master.gain.value = 0.9; mixerRef.current = m; setCtxReady(true);} }
+  function ensureCtx(){ if (!mixerRef.current){ const m = createMixer(); m.master.gain.value = 1.0; m.masterOut.gain.value = volumes.master; mixerRef.current = m; setCtxReady(true);} }
 
   const [delayTime, setDelayTime] = useState<number>(0.28);
   const [delayFeedback, setDelayFeedback] = useState<number>(0.30);
@@ -552,7 +572,7 @@ export default function App(){
   const [reverbSec, setReverbSec] = useState<number>(1.6);
   const [reverbMix, setReverbMix] = useState<number>(0.22);
 
-  useEffect(()=>{ const m = mixerRef.current; if(!m) return; m.drumBus.gain.value = mutes.drum ? 0 : volumes.drum; m.bassBus.gain.value = mutes.bass ? 0 : volumes.bass; m.guitarBus.gain.value = mutes.guitar ? 0 : volumes.guitar; m.leadBus.gain.value = volumes.lead; }, [volumes, mutes]);
+  useEffect(()=>{ const m = mixerRef.current; if(!m) return; m.masterOut.gain.value = volumes.master; m.drumBus.gain.value = mutes.drum ? 0 : volumes.drum; m.bassBus.gain.value = mutes.bass ? 0 : volumes.bass; m.guitarBus.gain.value = mutes.guitar ? 0 : volumes.guitar; m.leadBus.gain.value = volumes.lead; }, [volumes, mutes]);
   useEffect(()=>{ const m = mixerRef.current; if(!m) return; m.delay.delayTime.value = delayTime; m.delayFB.gain.value = delayFeedback; m.delayWet.gain.value = delayMix; m.reverbWet.gain.value = reverbMix; }, [delayTime, delayFeedback, delayMix, reverbMix]);
   useEffect(()=>{ const m = mixerRef.current; if(!m) return; m.reverb.buffer = createImpulseResponse(m.ctx, reverbSec); }, [reverbSec]);
 
@@ -565,9 +585,11 @@ export default function App(){
   const [drumLoops, setDrumLoops] = useState<LoopSlot[]>(Array.from({length:8}, (_,i)=>({name:'Drum Loop '+(i+1), buffer:null, volume:0.8, enabled:false, bars:4})));
   const [bassLoops, setBassLoops] = useState<LoopSlot[]>(Array.from({length:8}, (_,i)=>({name:'Bass Loop '+(i+1), buffer:null, volume:0.7, enabled:false, bars:4})));
 
-  const activeLoopsRef = useRef<Map<string, {src: AudioBufferSourceNode; gain: GainNode; startTime: number}>>(new Map());
+  type ActiveLoop = { mode:'native'; src: AudioBufferSourceNode; gain: GainNode; startTime: number } | { mode:'granular'; gain: GainNode; startTime: number; stop: ()=>void };
+  const activeLoopsRef = useRef<Map<string, ActiveLoop>>(new Map());
 
   const [drumAssign, setDrumAssign] = useState<{kick:number|null; snare:number|null; hat:number|null}>({kick:null, snare:null, hat:null});
+  const [preservePitch, setPreservePitch] = useState<boolean>(true);
 
   const sampleBank = useMemo(()=>{
     const m: SampleBank = { buffers: [], roots: [] };
@@ -617,36 +639,50 @@ export default function App(){
     const secondsPerBeat = 60 / tempo;
     const loopDurationInBeats = loop.bars * 4;
     const targetDuration = loopDurationInBeats * secondsPerBeat;
-    const playbackRate = loop.buffer.duration / targetDuration;
 
-    const src = m.ctx.createBufferSource();
-    src.buffer = loop.buffer;
-    src.loop = true;
-    src.loopStart = 0;
-    src.loopEnd = loop.buffer.duration;
-    src.playbackRate.value = playbackRate;
-
-    const gain = m.ctx.createGain();
-    gain.gain.value = loop.volume;
     const dest = kind==='drumloop' ? m.drumBus : m.bassBus;
-    src.connect(gain).connect(dest);
-
     let when = startTime ?? m.ctx.currentTime;
 
-    if(barIndex !== undefined && isPlaying){
-      const barOffsetInLoop = barIndex % loop.bars;
-      const offsetTime = (barOffsetInLoop * 4 * secondsPerBeat) % loop.buffer.duration;
-      src.start(when, offsetTime);
+    if (preservePitch){
+      const ratio = loop.buffer.duration / targetDuration;
+      let offsetTime = 0;
+      if(barIndex !== undefined && isPlaying){
+        const barOffsetInLoop = barIndex % loop.bars;
+        offsetTime = ((barOffsetInLoop * 4 * secondsPerBeat) * ratio) % loop.buffer.duration;
+      }
+      const node = startGranularPlayback(m, loop.buffer, dest, when, targetDuration, offsetTime, loop.volume);
+      activeLoopsRef.current.set(key, { mode:'granular', gain: node.gain, stop: node.stop, startTime: when });
     } else {
-      src.start(when, 0);
+      const playbackRate = loop.buffer.duration / targetDuration;
+      const src = m.ctx.createBufferSource();
+      src.buffer = loop.buffer;
+      src.loop = true;
+      src.loopStart = 0;
+      src.loopEnd = loop.buffer.duration;
+      src.playbackRate.value = playbackRate;
+
+      const gain = m.ctx.createGain();
+      gain.gain.value = loop.volume;
+      src.connect(gain).connect(dest);
+
+      if(barIndex !== undefined && isPlaying){
+        const barOffsetInLoop = barIndex % loop.bars;
+        const offsetTime = (barOffsetInLoop * 4 * secondsPerBeat) % loop.buffer.duration;
+        src.start(when, offsetTime);
+      } else {
+        src.start(when, 0);
+      }
+      activeLoopsRef.current.set(key, { mode:'native', src, gain, startTime: when });
     }
-    activeLoopsRef.current.set(key, {src, gain, startTime: when});
   }
 
   function stopLoop(key: string){
     const node = activeLoopsRef.current.get(key);
     if(node){
-      try { node.src.stop(); } catch(e){}
+      try {
+        if (node.mode === 'native') { node.src.stop(); }
+        else { node.stop(); }
+      } catch(e){}
       activeLoopsRef.current.delete(key);
     }
   }
@@ -674,6 +710,62 @@ export default function App(){
     }
   }
 
+  function startGranularPlayback(m: Mixer, buffer: AudioBuffer, dest: AudioNode, startAt: number, targetDuration: number, startOffsetSec: number, volume: number){
+    const ctx = m.ctx;
+    const sumGain = ctx.createGain();
+    sumGain.gain.value = volume;
+    sumGain.connect(dest);
+
+    const grainSize = 0.12; // seconds
+    const overlap = 0.5; // 50%
+    const hop = grainSize * (1 - overlap);
+    const ratio = buffer.duration / targetDuration; // read-speed ratio
+    const lookAhead = 0.2; // seconds
+
+    let playhead = startOffsetSec % buffer.duration;
+    let nextTime = startAt;
+    let stopped = false;
+    const scheduled: AudioBufferSourceNode[] = [];
+
+    function scheduleUntil(timeLimit: number){
+      while (!stopped && nextTime < timeLimit){
+        const src = ctx.createBufferSource();
+        src.buffer = buffer;
+        src.playbackRate.value = 1.0;
+        const g = ctx.createGain();
+        g.gain.setValueAtTime(0, nextTime);
+        g.gain.linearRampToValueAtTime(1, nextTime + grainSize * 0.5);
+        g.gain.linearRampToValueAtTime(0, nextTime + grainSize);
+        src.connect(g).connect(sumGain);
+        const offset = playhead % buffer.duration;
+        try { src.start(nextTime, offset, Math.min(grainSize + 0.02, buffer.duration - offset)); } catch {}
+        try { src.stop(nextTime + grainSize + 0.03); } catch {}
+        scheduled.push(src);
+        nextTime += hop;
+        playhead = (playhead + grainSize * ratio * (1 - 0)) % buffer.duration;
+      }
+    }
+
+    let rafId = 0;
+    function tick(){
+      if (stopped) return;
+      const tl = ctx.currentTime + lookAhead;
+      scheduleUntil(tl);
+      rafId = window.setTimeout(tick, Math.max(10, hop * 1000 * 0.5));
+    }
+    // Prime scheduling
+    scheduleUntil(ctx.currentTime + lookAhead);
+    rafId = window.setTimeout(tick, Math.max(10, hop * 1000 * 0.5));
+
+    function stop(){
+      stopped = true;
+      try { window.clearTimeout(rafId); } catch{}
+      scheduled.forEach(s=>{ try { s.stop(); } catch{} });
+      try { sumGain.disconnect(); } catch{}
+    }
+    return { gain: sumGain, stop };
+  }
+
   function toggleLoop(kind: 'drumloop'|'bassloop', index:number){
     const loop = kind==='drumloop' ? drumLoops[index] : bassLoops[index];
     const newEnabled = !loop.enabled;
@@ -690,7 +782,7 @@ export default function App(){
   }
 
   const drumBank = useMemo(()=> drumSlots.map(s=> s.buffer ?? null), [drumSlots]);
-  const { t, setT, start, stop, bars } = useTransport(mixerRef, seqId, {drum: (mutes.drum || drumSource==='loops')?0:volumes.drum, bass:(mutes.bass || bassSource==='loops')?0:volumes.bass, guitar:mutes.guitar?0:volumes.guitar}, drumAssign, drumBank);
+  const { t, setT, start, startAt, stop, bars } = useTransport(mixerRef, seqId, {drum: (mutes.drum || drumSource==='loops')?0:volumes.drum, bass:(mutes.bass || bassSource==='loops')?0:volumes.bass, guitar:mutes.guitar?0:volumes.guitar}, drumAssign, drumBank);
 
   const startAllEnabledLoops = (startTime?: number, barIndex?: number, isPlaying: boolean = true) => {
     drumLoops.forEach((loop, i)=> {
@@ -707,7 +799,8 @@ export default function App(){
     const m=mixerRef.current;
     if(!m) return;
     if(t.isPlaying){
-      const startTime = m.ctx.currentTime + 0.05;
+      const planned = t.nextTickTime;
+      const startTime = (planned && planned > m.ctx.currentTime) ? planned : (m.ctx.currentTime + 0.05);
       startAllEnabledLoops(startTime, t.barIndex, true);
     } else {
       activeLoopsRef.current.forEach((_, key)=> stopLoop(key));
@@ -735,7 +828,8 @@ export default function App(){
       const m=mixerRef.current;
       if(!m) return;
       activeLoopsRef.current.forEach((_, key)=> stopLoop(key));
-      const startTime = m.ctx.currentTime + 0.05;
+      const planned = t.nextTickTime;
+      const startTime = (planned && planned > m.ctx.currentTime) ? planned : (m.ctx.currentTime + 0.05);
       startAllEnabledLoops(startTime, t.barIndex, true);
     }
   }, [drumSource, bassSource]);
@@ -758,6 +852,94 @@ export default function App(){
 
   const currentChord = bars[t.barIndex % bars.length]?.chord || {root:0, qual:"7" as const};
   const highlightPCs = useMemo(()=> bluesScalePitchesForChord(currentChord), [currentChord]);
+  function handleTapTempo(){
+    const now = performance.now();
+    const arr = tapTimesRef.current;
+    if (arr.length>0 && now - arr[arr.length-1] > 2500) { arr.length = 0; }
+    arr.push(now);
+    if (arr.length >= 2){
+      const recent = arr.slice(-6);
+      const intervals = recent.slice(1).map((t,i)=> t - recent[i]);
+      const avg = intervals.reduce((a,b)=>a+b,0) / intervals.length;
+      if (avg > 0){
+        const bpm = Math.max(60, Math.min(160, Math.round(60000/avg)));
+        setTempo(bpm);
+      }
+    }
+  }
+
+  function playCountInAndStart(){
+    ensureCtx();
+    const m = mixerRef.current; if (!m) return;
+    const spb = 60 / tempo;
+    const startAtTime = m.ctx.currentTime + spb * 4;
+    for (let b=0;b<4;b++){
+      const tBeat = m.ctx.currentTime + spb * b;
+      if (b === 3) { playSnareSynth(m, tBeat, 0.7); }
+      else { playHatSynth(m, tBeat, 0.5, true); }
+    }
+    startAt(startAtTime + 0.02);
+  }
+
+  useEffect(()=>{
+    function onGlobalKey(e: KeyboardEvent){
+      const target = e.target as HTMLElement | null;
+      const tag = target?.tagName?.toLowerCase();
+      const isEditable = tag === 'input' || tag === 'select' || tag === 'textarea' || (target?.isContentEditable ?? false);
+      if (isEditable) return;
+      if (e.key === ' '){ e.preventDefault(); if (t.isPlaying) stop(); else { ensureCtx(); countIn ? playCountInAndStart() : start(); } }
+      else if (e.key === 't' || e.key === 'T'){ handleTapTempo(); }
+      else if (e.key === '+' || e.key === '='){ setTempo(v=> Math.min(160, v + (e.shiftKey?5:1))); }
+      else if (e.key === '-' || e.key === '_'){ setTempo(v=> Math.max(60, v - (e.shiftKey?5:1))); }
+    }
+    window.addEventListener('keydown', onGlobalKey);
+    return ()=> window.removeEventListener('keydown', onGlobalKey);
+  }, [t.isPlaying, countIn]);
+
+  // Persist settings (no audio buffers)
+  useEffect(()=>{
+    const save = {
+      v:1,
+      seqId, tempo, volumes, mutes, drumSource, bassSource, leadEngine, quantize, maxVoices, preservePitch,
+      delayTime, delayFeedback, delayMix, reverbSec, reverbMix, drumAssign,
+      guitarSlots: guitarSlots.map(s=> ({name:s.name, root:s.root, selected:s.selected})),
+      drumSlots: drumSlots.map(s=> ({name:s.name})),
+      bassSlots: bassSlots.map(s=> ({name:s.name, root:s.root})),
+      drumLoops: drumLoops.map(l=> ({name:l.name, volume:l.volume, enabled:l.enabled, bars:l.bars})),
+      bassLoops: bassLoops.map(l=> ({name:l.name, volume:l.volume, enabled:l.enabled, bars:l.bars})),
+    };
+    try { localStorage.setItem('bluesLooper:v1', JSON.stringify(save)); } catch {}
+  }, [seqId, tempo, volumes, mutes, drumSource, bassSource, leadEngine, quantize, maxVoices, preservePitch, delayTime, delayFeedback, delayMix, reverbSec, reverbMix, drumAssign, guitarSlots, drumSlots, bassSlots, drumLoops, bassLoops]);
+
+  useEffect(()=>{
+    try {
+      const raw = localStorage.getItem('bluesLooper:v1'); if (!raw) return;
+      const s = JSON.parse(raw);
+      if (!s || typeof s !== 'object') return;
+      if (typeof s.seqId === 'string') setSeqId(s.seqId);
+      if (typeof s.tempo === 'number') setTempo(s.tempo);
+      if (s.volumes) setVolumes((prev)=> ({...prev, ...s.volumes}));
+      if (s.mutes) setMutes((prev)=> ({...prev, ...s.mutes}));
+      if (s.drumSource) setDrumSource(s.drumSource);
+      if (s.bassSource) setBassSource(s.bassSource);
+      if (s.leadEngine) setLeadEngine(s.leadEngine);
+      if (typeof s.quantize === 'boolean') setQuantize(s.quantize);
+      if (typeof s.maxVoices === 'number') setMaxVoices(s.maxVoices);
+      if (typeof s.preservePitch === 'boolean') setPreservePitch(s.preservePitch);
+      if (typeof s.delayTime === 'number') setDelayTime(s.delayTime);
+      if (typeof s.delayFeedback === 'number') setDelayFeedback(s.delayFeedback);
+      if (typeof s.delayMix === 'number') setDelayMix(s.delayMix);
+      if (typeof s.reverbSec === 'number') setReverbSec(s.reverbSec);
+      if (typeof s.reverbMix === 'number') setReverbMix(s.reverbMix);
+      if (s.drumAssign) setDrumAssign((prev)=> ({...prev, ...s.drumAssign}));
+      if (Array.isArray(s.guitarSlots)) setGuitarSlots(prev=> prev.map((p,i)=> ({...p, ...(s.guitarSlots[i] ?? {})})));
+      if (Array.isArray(s.drumSlots)) setDrumSlots(prev=> prev.map((p,i)=> ({...p, ...(s.drumSlots[i] ?? {})})));
+      if (Array.isArray(s.bassSlots)) setBassSlots(prev=> prev.map((p,i)=> ({...p, ...(s.bassSlots[i] ?? {})})));
+      if (Array.isArray(s.drumLoops)) setDrumLoops(prev=> prev.map((p,i)=> ({...p, ...(s.drumLoops[i] ?? {})})));
+      if (Array.isArray(s.bassLoops)) setBassLoops(prev=> prev.map((p,i)=> ({...p, ...(s.bassLoops[i] ?? {})})));
+    } catch {}
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(()=>{
     try {
@@ -778,7 +960,15 @@ export default function App(){
             <select value={seqId} onChange={e=>setSeqId(e.target.value)} onFocus={ensureCtx}>{SEQUENCES.map(s=> <option key={s.id} value={s.id}>{s.title}</option>)}</select>
             <label>Tempo: {tempo} bpm</label>
             <input type="range" min={60} max={160} value={tempo} onChange={e=>setTempo(parseInt(e.target.value))} onMouseDown={ensureCtx} />
-            {!t.isPlaying ? (<button className="btn primary" onClick={()=>{ ensureCtx(); start(); }}>Play</button>):(<button className="btn stop" onClick={stop}>Stop</button>)}
+            <button className="btn" onClick={handleTapTempo}>Tap</button>
+            <label style={{display:'flex', alignItems:'center', gap:6}}>
+              <input type="checkbox" checked={countIn} onChange={e=>setCountIn(e.target.checked)} /> Count-in
+            </label>
+            {!t.isPlaying ? (
+              <button className="btn primary" onClick={()=>{ ensureCtx(); countIn ? playCountInAndStart() : start(); }}>Play</button>
+            ):(
+              <button className="btn stop" onClick={stop}>Stop</button>
+            )}
           </div>
 
           <div className="panel" style={{marginTop:14}}>
@@ -810,8 +1000,13 @@ export default function App(){
                   <option value="loops">Loops</option>
                 </select>
               </label>
+              <label style={{display:'flex', alignItems:'center', gap:'6px'}}>
+                Preserve Loop Pitch:
+                <input type="checkbox" checked={preservePitch} onChange={e=>setPreservePitch(e.target.checked)} />
+              </label>
             </div>
             <div className="mixer">
+              <Strip name="Master" value={volumes.master} onChange={v=>setVolumes({...volumes, master:v})} muted={false} onToggleMute={()=>{}}/>
               <Strip name="Drums" value={volumes.drum} onChange={v=>setVolumes({...volumes, drum:v})} muted={mutes.drum} onToggleMute={()=>setMutes({...mutes, drum:!mutes.drum})}/>
               <Strip name="Bass" value={volumes.bass} onChange={v=>setVolumes({...volumes, bass:v})} muted={mutes.bass} onToggleMute={()=>setMutes({...mutes, bass:!mutes.bass})}/>
               <Strip name="Guitar" value={volumes.guitar} onChange={v=>setVolumes({...volumes, guitar:v})} muted={mutes.guitar} onToggleMute={()=>setMutes({...mutes, guitar:!mutes.guitar})}/>
