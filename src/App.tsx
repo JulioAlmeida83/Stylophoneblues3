@@ -585,9 +585,11 @@ export default function App(){
   const [drumLoops, setDrumLoops] = useState<LoopSlot[]>(Array.from({length:8}, (_,i)=>({name:'Drum Loop '+(i+1), buffer:null, volume:0.8, enabled:false, bars:4})));
   const [bassLoops, setBassLoops] = useState<LoopSlot[]>(Array.from({length:8}, (_,i)=>({name:'Bass Loop '+(i+1), buffer:null, volume:0.7, enabled:false, bars:4})));
 
-  const activeLoopsRef = useRef<Map<string, {src: AudioBufferSourceNode; gain: GainNode; startTime: number}>>(new Map());
+  type ActiveLoop = { mode:'native'; src: AudioBufferSourceNode; gain: GainNode; startTime: number } | { mode:'granular'; gain: GainNode; startTime: number; stop: ()=>void };
+  const activeLoopsRef = useRef<Map<string, ActiveLoop>>(new Map());
 
   const [drumAssign, setDrumAssign] = useState<{kick:number|null; snare:number|null; hat:number|null}>({kick:null, snare:null, hat:null});
+  const [preservePitch, setPreservePitch] = useState<boolean>(true);
 
   const sampleBank = useMemo(()=>{
     const m: SampleBank = { buffers: [], roots: [] };
@@ -637,36 +639,50 @@ export default function App(){
     const secondsPerBeat = 60 / tempo;
     const loopDurationInBeats = loop.bars * 4;
     const targetDuration = loopDurationInBeats * secondsPerBeat;
-    const playbackRate = loop.buffer.duration / targetDuration;
 
-    const src = m.ctx.createBufferSource();
-    src.buffer = loop.buffer;
-    src.loop = true;
-    src.loopStart = 0;
-    src.loopEnd = loop.buffer.duration;
-    src.playbackRate.value = playbackRate;
-
-    const gain = m.ctx.createGain();
-    gain.gain.value = loop.volume;
     const dest = kind==='drumloop' ? m.drumBus : m.bassBus;
-    src.connect(gain).connect(dest);
-
     let when = startTime ?? m.ctx.currentTime;
 
-    if(barIndex !== undefined && isPlaying){
-      const barOffsetInLoop = barIndex % loop.bars;
-      const offsetTime = (barOffsetInLoop * 4 * secondsPerBeat) % loop.buffer.duration;
-      src.start(when, offsetTime);
+    if (preservePitch){
+      const ratio = loop.buffer.duration / targetDuration;
+      let offsetTime = 0;
+      if(barIndex !== undefined && isPlaying){
+        const barOffsetInLoop = barIndex % loop.bars;
+        offsetTime = ((barOffsetInLoop * 4 * secondsPerBeat) * ratio) % loop.buffer.duration;
+      }
+      const node = startGranularPlayback(m, loop.buffer, dest, when, targetDuration, offsetTime, loop.volume);
+      activeLoopsRef.current.set(key, { mode:'granular', gain: node.gain, stop: node.stop, startTime: when });
     } else {
-      src.start(when, 0);
+      const playbackRate = loop.buffer.duration / targetDuration;
+      const src = m.ctx.createBufferSource();
+      src.buffer = loop.buffer;
+      src.loop = true;
+      src.loopStart = 0;
+      src.loopEnd = loop.buffer.duration;
+      src.playbackRate.value = playbackRate;
+
+      const gain = m.ctx.createGain();
+      gain.gain.value = loop.volume;
+      src.connect(gain).connect(dest);
+
+      if(barIndex !== undefined && isPlaying){
+        const barOffsetInLoop = barIndex % loop.bars;
+        const offsetTime = (barOffsetInLoop * 4 * secondsPerBeat) % loop.buffer.duration;
+        src.start(when, offsetTime);
+      } else {
+        src.start(when, 0);
+      }
+      activeLoopsRef.current.set(key, { mode:'native', src, gain, startTime: when });
     }
-    activeLoopsRef.current.set(key, {src, gain, startTime: when});
   }
 
   function stopLoop(key: string){
     const node = activeLoopsRef.current.get(key);
     if(node){
-      try { node.src.stop(); } catch(e){}
+      try {
+        if (node.mode === 'native') { node.src.stop(); }
+        else { node.stop(); }
+      } catch(e){}
       activeLoopsRef.current.delete(key);
     }
   }
@@ -692,6 +708,62 @@ export default function App(){
       stopLoop(key);
       setTimeout(()=> startLoop(kind, index, undefined, t.barIndex), 50);
     }
+  }
+
+  function startGranularPlayback(m: Mixer, buffer: AudioBuffer, dest: AudioNode, startAt: number, targetDuration: number, startOffsetSec: number, volume: number){
+    const ctx = m.ctx;
+    const sumGain = ctx.createGain();
+    sumGain.gain.value = volume;
+    sumGain.connect(dest);
+
+    const grainSize = 0.12; // seconds
+    const overlap = 0.5; // 50%
+    const hop = grainSize * (1 - overlap);
+    const ratio = buffer.duration / targetDuration; // read-speed ratio
+    const lookAhead = 0.2; // seconds
+
+    let playhead = startOffsetSec % buffer.duration;
+    let nextTime = startAt;
+    let stopped = false;
+    const scheduled: AudioBufferSourceNode[] = [];
+
+    function scheduleUntil(timeLimit: number){
+      while (!stopped && nextTime < timeLimit){
+        const src = ctx.createBufferSource();
+        src.buffer = buffer;
+        src.playbackRate.value = 1.0;
+        const g = ctx.createGain();
+        g.gain.setValueAtTime(0, nextTime);
+        g.gain.linearRampToValueAtTime(1, nextTime + grainSize * 0.5);
+        g.gain.linearRampToValueAtTime(0, nextTime + grainSize);
+        src.connect(g).connect(sumGain);
+        const offset = playhead % buffer.duration;
+        try { src.start(nextTime, offset, Math.min(grainSize + 0.02, buffer.duration - offset)); } catch {}
+        try { src.stop(nextTime + grainSize + 0.03); } catch {}
+        scheduled.push(src);
+        nextTime += hop;
+        playhead = (playhead + grainSize * ratio * (1 - 0)) % buffer.duration;
+      }
+    }
+
+    let rafId = 0;
+    function tick(){
+      if (stopped) return;
+      const tl = ctx.currentTime + lookAhead;
+      scheduleUntil(tl);
+      rafId = window.setTimeout(tick, Math.max(10, hop * 1000 * 0.5));
+    }
+    // Prime scheduling
+    scheduleUntil(ctx.currentTime + lookAhead);
+    rafId = window.setTimeout(tick, Math.max(10, hop * 1000 * 0.5));
+
+    function stop(){
+      stopped = true;
+      try { window.clearTimeout(rafId); } catch{}
+      scheduled.forEach(s=>{ try { s.stop(); } catch{} });
+      try { sumGain.disconnect(); } catch{}
+    }
+    return { gain: sumGain, stop };
   }
 
   function toggleLoop(kind: 'drumloop'|'bassloop', index:number){
@@ -828,7 +900,7 @@ export default function App(){
   useEffect(()=>{
     const save = {
       v:1,
-      seqId, tempo, volumes, mutes, drumSource, bassSource, leadEngine, quantize, maxVoices,
+      seqId, tempo, volumes, mutes, drumSource, bassSource, leadEngine, quantize, maxVoices, preservePitch,
       delayTime, delayFeedback, delayMix, reverbSec, reverbMix, drumAssign,
       guitarSlots: guitarSlots.map(s=> ({name:s.name, root:s.root, selected:s.selected})),
       drumSlots: drumSlots.map(s=> ({name:s.name})),
@@ -837,7 +909,7 @@ export default function App(){
       bassLoops: bassLoops.map(l=> ({name:l.name, volume:l.volume, enabled:l.enabled, bars:l.bars})),
     };
     try { localStorage.setItem('bluesLooper:v1', JSON.stringify(save)); } catch {}
-  }, [seqId, tempo, volumes, mutes, drumSource, bassSource, leadEngine, quantize, maxVoices, delayTime, delayFeedback, delayMix, reverbSec, reverbMix, drumAssign, guitarSlots, drumSlots, bassSlots, drumLoops, bassLoops]);
+  }, [seqId, tempo, volumes, mutes, drumSource, bassSource, leadEngine, quantize, maxVoices, preservePitch, delayTime, delayFeedback, delayMix, reverbSec, reverbMix, drumAssign, guitarSlots, drumSlots, bassSlots, drumLoops, bassLoops]);
 
   useEffect(()=>{
     try {
@@ -853,6 +925,7 @@ export default function App(){
       if (s.leadEngine) setLeadEngine(s.leadEngine);
       if (typeof s.quantize === 'boolean') setQuantize(s.quantize);
       if (typeof s.maxVoices === 'number') setMaxVoices(s.maxVoices);
+      if (typeof s.preservePitch === 'boolean') setPreservePitch(s.preservePitch);
       if (typeof s.delayTime === 'number') setDelayTime(s.delayTime);
       if (typeof s.delayFeedback === 'number') setDelayFeedback(s.delayFeedback);
       if (typeof s.delayMix === 'number') setDelayMix(s.delayMix);
@@ -926,6 +999,10 @@ export default function App(){
                   <option value="sequence">Sequence</option>
                   <option value="loops">Loops</option>
                 </select>
+              </label>
+              <label style={{display:'flex', alignItems:'center', gap:'6px'}}>
+                Preserve Loop Pitch:
+                <input type="checkbox" checked={preservePitch} onChange={e=>setPreservePitch(e.target.checked)} />
               </label>
             </div>
             <div className="mixer">
