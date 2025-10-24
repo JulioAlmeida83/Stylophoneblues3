@@ -36,7 +36,6 @@ type Arrangement = {
 
 // ====== Música util ======
 
-const NOTE_NAMES_SHARP = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"] as const;
 const NOTE_NAMES_FLAT  = ["C","Db","D","Eb","E","F","Gb","G","Ab","A","Bb","B"] as const;
 const MAJOR_SCALE_DEGREES = [0, 2, 4, 5, 7, 9, 11];
 const DEGREE_LABELS = ["I","II","III","IV","V","VI","VII°"] as const;
