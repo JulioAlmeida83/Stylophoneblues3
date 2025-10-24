@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
+    "analyze": "vite build --mode analyze && (echo 'Open dist/stats.html in your browser')",
     "lint": "eslint .",
     "preview": "vite preview"
   },
@@ -23,8 +24,13 @@
     "eslint-plugin-react-hooks": "^5.2.0",
     "eslint-plugin-react-refresh": "^0.4.24",
     "globals": "^16.4.0",
+    "lightningcss": "^1.30.2",
+    "preact": "^10.27.2",
+    "rollup-plugin-visualizer": "^5.14.0",
+    "terser": "^5.44.0",
     "typescript": "~5.9.3",
     "typescript-eslint": "^8.46.1",
-    "vite": "^7.1.10"
+    "vite": "^7.1.10",
+    "vite-plugin-compression": "^0.5.1"
   }
 }
